@@ -1,0 +1,272 @@
+# -*- coding: utf-8 -*-
+"""
+Seaborn 漂亮示意图：
+- 线段–球（最近点投影+clip）判定得到的遮蔽二值时间轴
+- 面平均透过率曲线
+- 顶视几何快照（起爆前/遮蔽中/遮蔽末）
+"""
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+import math
+
+# ----------------------------
+# 1) 场景与几何工具
+# ----------------------------
+def clip(x, a, b):
+    return min(b, max(a, x))
+
+def seg_hits_sphere(M, P, C, R, eps=1e-12, tol=1e-9):
+    """线段 MP 是否与球 (C,R) 相交：最近点投影 + clip。"""
+    u = P - M
+    uu = float(u @ u)
+    if uu < eps:  # 退化成点
+        return float((M - C) @ (M - C)) <= R * R * (1 + tol)
+    s0 = float((C - M) @ u) / uu
+    lam = clip(s0, 0.0, 1.0)
+    Q = M + lam * u
+    d2 = float((C - Q) @ (C - Q))
+    return d2 <= R * R * (1 + tol)
+
+def seg_sphere_intersection_length(M, P, C, R, eps=1e-12):
+    """线段 MP 与球的交段长度（落在线段内的那部分），无交返回 0。"""
+    u = P - M
+    uu = float(u @ u)
+    if uu < eps:
+        return 0.0
+    a = uu
+    b = 2.0 * float((M - C) @ u)
+    c = float((M - C) @ (M - C) - R * R)
+    D = b * b - 4 * a * c
+    if D < 0:
+        return 0.0
+    s1 = (-b - math.sqrt(max(0.0, D))) / (2 * a)
+    s2 = (-b + math.sqrt(max(0.0, D))) / (2 * a)
+    left = max(0.0, min(s1, s2))
+    right = min(1.0, max(s1, s2))
+    if right <= left:
+        return 0.0
+    return (right - left) * math.sqrt(uu)
+
+def sample_disk(center, radius, n_boundary=120, n_inner=16):
+    """离散圆盘（边界 + 同心内环）。"""
+    pts = []
+    # 边界
+    for k in range(max(12, n_boundary)):
+        ang = 2 * math.pi * k / max(12, n_boundary)
+        pts.append(center + np.array([radius * math.cos(ang),
+                                      radius * math.sin(ang), 0.0]))
+    # 内环
+    for r in np.linspace(0.0, radius * 0.95, max(1, n_inner)):
+        m = max(12, int(24 * (r / radius if radius > 0 else 0) + 12))
+        for k in range(m):
+            ang = 2 * math.pi * k / m
+            pts.append(center + np.array([r * math.cos(ang),
+                                          r * math.sin(ang), 0.0]))
+    return np.vstack(pts)
+
+@dataclass
+class Smoke:
+    te: float
+    C0: np.ndarray
+    vh: np.ndarray       # 起爆前水平速度
+    g: float
+    vz0: float
+    v_settle: float      # 起爆后竖直下沉（水平速度=0）
+    R0: float
+    grow: float
+    Tg: float
+    Rmax: float
+    alive_until: float = 1e9
+
+    def C(self, t: float) -> np.ndarray:
+        if t < self.te:
+            dt = t
+            return (self.C0 + self.vh * dt
+                    + np.array([0.0, 0.0, self.vz0 * dt - 0.5 * self.g * dt * dt]))
+        else:
+            Ce = (self.C0 + self.vh * self.te
+                  + np.array([0.0, 0.0, self.vz0 * self.te - 0.5 * self.g * self.te * self.te]))
+            return Ce + np.array([0.0, 0.0, -self.v_settle * (t - self.te)])
+
+    def R(self, t: float) -> float:
+        if t < self.te:
+            return 0.0
+        dt = t - self.te
+        r = self.R0 + self.grow * dt
+        return r if dt < self.Tg else self.Rmax
+
+    def alive(self, t: float) -> bool:
+        return t <= self.alive_until
+
+@dataclass
+class Missile:
+    M0: np.ndarray
+    vM: np.ndarray
+    def M(self, t: float) -> np.ndarray:
+        return self.M0 + self.vM * t
+
+# ----------------------------
+# 2) 计算时间序列
+# ----------------------------
+def fully_masked(t, target_pts, missile, smokes):
+    M = missile.M(t)
+    active = [(s.C(t), s.R(t)) for s in smokes if s.alive(t) and s.R(t) > 0]
+    if not active:
+        return False
+    for P in target_pts:
+        ok = False
+        for C, R in active:
+            if seg_hits_sphere(M, P, C, R):
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+def avg_transmittance(t, target_pts, missile, smokes, kappa=1.0):
+    M = missile.M(t)
+    active = [(s.C(t), s.R(t)) for s in smokes if s.alive(t) and s.R(t) > 0]
+    if not active:
+        return 1.0
+    Ts = []
+    for P in target_pts:
+        Lsum = 0.0
+        for C, R in active:
+            Lsum += seg_sphere_intersection_length(M, P, C, R)
+        Ts.append(math.exp(-kappa * Lsum))
+    return sum(Ts) / len(Ts)
+
+def masking_intervals(times, states):
+    """从 0/1 序列生成遮蔽区间列表。"""
+    intervals = []
+    in_mask = states[0] == 1
+    start = times[0] if in_mask else None
+    for i in range(1, len(times)):
+        if states[i] != states[i-1]:
+            if states[i] == 1:  # 进入遮蔽
+                start = times[i]
+            else:               # 离开遮蔽
+                intervals.append((start, times[i]))
+                start = None
+    if start is not None:
+        intervals.append((start, times[-1]))
+    return intervals
+
+# ----------------------------
+# 3) 画图（Seaborn 风格）
+# ----------------------------
+def draw_circle(ax, xy, r, **kwargs):
+    from matplotlib.patches import Circle
+    c = Circle(xy, r, **kwargs)
+    ax.add_patch(c)
+    return c
+
+def main():
+    # 场景（与之前示例一致，能产生 ~1.39 s 遮蔽）
+    target_center = np.array([0.0, 0.0, 0.0])
+    target_radius = 3.0
+    target_pts = sample_disk(target_center, target_radius, 120, 16)
+
+    missile = Missile(M0=np.array([-200.0, 0.0, 1.0]),
+                      vM=np.array([100.0, 0.0, 0.0]))
+
+    smoke = Smoke(
+        te=1.0,
+        C0=np.array([-30.0, 0.0, 1.0]),
+        vh=np.array([30.0, 0.0, 0.0]),
+        g=0.0, vz0=0.0,
+        v_settle=1.93,
+        R0=0.5, grow=4.0, Tg=0.5, Rmax=4.0
+    )
+
+    Tmin, Tmax, dt = 0.0, 4.0, 0.01
+    times = np.arange(Tmin, Tmax + 1e-12, dt)
+
+    # 计算时间序列
+    masked = np.array([1 if fully_masked(t, target_pts, missile, [smoke]) else 0 for t in times])
+    trans  = np.array([avg_transmittance(t, target_pts, missile, [smoke], kappa=1.0) for t in times])
+    intervals = masking_intervals(times, masked)
+    total = sum(b - a for a, b in intervals)
+
+    # ================== Seaborn 全局样式 ==================
+    sns.set_theme(style="whitegrid", context="talk", font_scale=1.05)
+    sns.set_palette("crest")
+
+    # 1) 时间轴 + 透过率
+    df = pd.DataFrame({"time": times, "masked": masked, "transmittance": trans})
+    fig1, ax1 = plt.subplots(figsize=(10.5, 3.2))
+    # 二值遮蔽用阶梯（matplotlib）+ seaborn 风格；透过率用 seaborn 折线
+    ax1.step(df["time"], df["masked"], where="post", linewidth=2.0, label="有效遮蔽 (0/1)")
+    sns.lineplot(data=df, x="time", y="transmittance", ax=ax1, linewidth=2.2, label="透过率")
+    ax1.set_ylim(-0.1, 1.1)
+    ax1.set_xlabel("时间 (s)")
+    ax1.set_title(f"有效遮蔽时间轴与透过率（总遮蔽 ≈ {total:.3f}s）")
+    ax1.legend(loc="upper right", frameon=True)
+    sns.despine(fig=fig1, ax=ax1)
+    fig1.tight_layout()
+
+    # 2) 顶视几何快照（起爆前/遮蔽中/遮蔽末）
+    #    为直观选择三个代表时刻：te-0.1, 遮蔽区间中点, 遮蔽区间末-0.05
+    if intervals:
+        tA = max(Tmin, smoke.te - 0.10)
+        mid = 0.5 * (intervals[0][0] + intervals[0][1])
+        tB = mid
+        tC = max(Tmin, intervals[0][1] - 0.05)
+    else:
+        tA, tB, tC = smoke.te - 0.10, smoke.te + 0.25, smoke.te + 0.50
+
+    def snapshot(ax, t, title):
+        # 顶视：画目标圆、烟幕投影圆、导弹位置
+        M = missile.M(t); C = smoke.C(t); R = smoke.R(t)
+        # 目标
+        draw_circle(ax, (target_center[0], target_center[1]),
+                    target_radius, edgecolor="#334155", facecolor="none", linewidth=2.0)
+        # 烟幕（顶视投影为圆示意）
+        if R > 0:
+            draw_circle(ax, (C[0], C[1]), R, edgecolor=None, facecolor=sns.color_palette()[0], alpha=0.25)
+            draw_circle(ax, (C[0], C[1]), R, edgecolor=sns.color_palette()[0], facecolor="none", linewidth=2)
+        # 导弹位置（点）
+        ax.scatter([M[0]], [M[1]], s=60, marker="X", zorder=5, label="导弹")
+        # 目标中心
+        ax.scatter([0], [0], s=20, color="#111827", zorder=6)
+        ax.set_aspect("equal")
+        ax.set_xlim(-40, 40)
+        ax.set_ylim(-25, 25)
+        ax.set_xlabel("X / m")
+        ax.set_ylabel("Y / m")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.25)
+
+    fig2, axes = plt.subplots(1, 3, figsize=(13.5, 4.2))
+    snapshot(axes[0], tA, f"起爆前  t={tA:.2f}s")
+    snapshot(axes[1], tB, f"遮蔽中  t={tB:.2f}s")
+    snapshot(axes[2], tC, f"遮蔽末  t={tC:.2f}s")
+    sns.despine(fig=fig2)
+    fig2.tight_layout()
+
+    # 3) 遮蔽区间标注图（阴影显示）
+    fig3, ax3 = plt.subplots(figsize=(10.5, 2.8))
+    sns.lineplot(data=df, x="time", y="transmittance", ax=ax3, linewidth=2.2, label="透过率")
+    ax3.step(df["time"], df["masked"], where="post", linewidth=1.8, color="#64748b", alpha=0.7, label="有效遮蔽 (0/1)")
+    for (a, b) in intervals:
+        ax3.axvspan(a, b, color=sns.color_palette()[0], alpha=0.15)
+    ax3.set_ylim(-0.1, 1.1)
+    ax3.set_xlabel("时间 (s)")
+    ax3.set_title("遮蔽区间高亮示意")
+    ax3.legend(loc="upper right", frameon=True)
+    sns.despine(fig=fig3, ax=ax3)
+    fig3.tight_layout()
+
+    # 保存文件
+    fig1.savefig("seaborn_mask_timeline.png", dpi=180)
+    fig2.savefig("seaborn_geometry_snapshots.png", dpi=180)
+    fig3.savefig("seaborn_mask_intervals.png", dpi=180)
+    print("保存：seaborn_mask_timeline.png, seaborn_geometry_snapshots.png, seaborn_mask_intervals.png")
+    print("遮蔽区间：", [(round(a,3), round(b,3)) for a,b in intervals], "总时长：", round(total,3), "s")
+
+if __name__ == "__main__":
+    main()
