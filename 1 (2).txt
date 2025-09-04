@@ -1,0 +1,134 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import math
+from dataclasses import dataclass
+from typing import List, Tuple
+
+def clip(x: float, a: float, b: float) -> float:
+    return min(b, max(a, x))
+
+def seg_hits_sphere(M, P, C, R, eps=1e-12, tol=1e-9):
+    u = P - M
+    uu = float(u @ u)
+    if uu < eps:
+        return float((M - C) @ (M - C)) <= R*R*(1+tol)
+    s0 = float((C - M) @ u) / uu
+    lam = clip(s0, 0.0, 1.0)
+    Q = M + lam * u
+    d2 = float((C - Q) @ (C - Q))
+    return d2 <= R*R*(1+tol)
+
+def sample_disk(center, radius, n_boundary=180, n_inner=20):
+    pts = []
+    for k in range(max(12, n_boundary)):
+        ang = 2*math.pi*k/max(12, n_boundary)
+        pts.append(center + np.array([radius*math.cos(ang), radius*math.sin(ang), 0.0]))
+    for r in np.linspace(0.0, radius*0.95, max(1, n_inner)):
+        m = max(12, int(24 * (r/radius if radius>0 else 0) + 12))
+        for k in range(m):
+            ang = 2*math.pi*k/m
+            pts.append(center + np.array([r*math.cos(ang), r*math.sin(ang), 0.0]))
+    return np.vstack(pts)
+
+@dataclass
+class SmokeConfig:
+    te: float
+    C0: np.ndarray
+    vh: np.ndarray
+    g: float
+    vz0: float
+    v_settle: float
+    R0: float
+    grow: float
+    Tg: float
+    Rmax: float
+    alive_until: float
+    def C(self, t: float) -> np.ndarray:
+        if t < self.te:
+            dt = t
+            return (self.C0 + self.vh*dt + np.array([0.0,0.0,self.vz0*dt - 0.5*self.g*dt*dt]))
+        else:
+            Ce = (self.C0 + self.vh*self.te + np.array([0.0,0.0,self.vz0*self.te - 0.5*self.g*self.te*self.te]))
+            return Ce + np.array([0.0,0.0,-self.v_settle*(t-self.te)])
+    def R(self, t: float) -> float:
+        if t < self.te: return 0.0
+        dt = t - self.te
+        r = self.R0 + self.grow*dt
+        return r if dt < self.Tg else self.Rmax
+    def alive(self, t: float) -> bool:
+        return t <= self.alive_until
+
+@dataclass
+class MissileConfig:
+    M0: np.ndarray
+    vM: np.ndarray
+    def M(self, t: float) -> np.ndarray:
+        return self.M0 + self.vM * t
+
+@dataclass
+class TargetConfig:
+    center: np.ndarray
+    radius: float
+    n_boundary: int = 180
+    n_inner: int = 20
+    def sample_points(self) -> np.ndarray:
+        return sample_disk(self.center, self.radius, self.n_boundary, self.n_inner)
+
+def fully_masked_at_time(t: float, target_pts: np.ndarray, missile: MissileConfig, smokes: List[SmokeConfig]) -> bool:
+    M = missile.M(t)
+    active = [(s.C(t), s.R(t)) for s in smokes if s.alive(t) and s.R(t) > 0.0]
+    if not active: return False
+    for P in target_pts:
+        ok = False
+        for C, R in active:
+            if seg_hits_sphere(M, P, C, R):
+                ok = True; break
+        if not ok: return False
+    return True
+
+def refine_edge(a: float, b: float, target_pts, missile, smokes, z_a: bool, iters: int = 30) -> float:
+    L, R = a, b; za = z_a
+    for _ in range(iters):
+        m = 0.5*(L+R)
+        zm = fully_masked_at_time(m, target_pts, missile, smokes)
+        if zm == za: L = m
+        else: R = m
+    return 0.5*(L+R)
+
+def union_length(intervals: List[Tuple[float, float]]) -> float:
+    if not intervals: return 0.0
+    intervals = sorted(intervals)
+    tot = 0.0; L, R = intervals[0]
+    for l, r in intervals[1:]:
+        if l > R: tot += max(0.0, R-L); L, R = l, r
+        else: R = max(R, r)
+    tot += max(0.0, R-L)
+    return tot
+
+def compute_effective_mask_time(Tmin, Tmax, dt, target, missile, smokes):
+    pts = target.sample_points()
+    times = np.arange(Tmin, Tmax + 1e-12, dt)
+    states = [fully_masked_at_time(t, pts, missile, smokes) for t in times]
+    intervals = []; in_mask = states[0]; start = times[0] if in_mask else None
+    for k in range(1, len(times)):
+        if states[k] != states[k-1]:
+            a, b = times[k-1], times[k]
+            edge = refine_edge(a, b, pts, missile, smokes, states[k-1])
+            if states[k]: start = edge
+            else: intervals.append((start, edge)); start = None
+    if start is not None: intervals.append((start, times[-1]))
+    return union_length(intervals), intervals
+
+def demo():
+    target = TargetConfig(center=np.array([0.0,0.0,0.0]), radius=3.0, n_boundary=120, n_inner=16)
+    missile = MissileConfig(M0=np.array([-200.0,0.0,1.0]), vM=np.array([100.0,0.0,0.0]))
+    smoke = SmokeConfig(te=1.0, C0=np.array([-30.0,0.0,1.0]), vh=np.array([30.0,0.0,0.0]),
+                        g=0.0, vz0=0.0, v_settle=1.93, R0=0.5, grow=4.0, Tg=0.5, Rmax=4.0,
+                        alive_until=1e9)
+    Tmin, Tmax, dt = 0.0, 4.0, 0.01
+    total, intervals = compute_effective_mask_time(Tmin, Tmax, dt, target, missile, [smoke])
+    print('Intervals:', intervals)
+    print('Total:', total)
+
+if __name__ == '__main__':
+    demo()
